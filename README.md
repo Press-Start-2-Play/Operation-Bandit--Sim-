@@ -1,154 +1,116 @@
-# Swarm Robotics Search Algorithm — Simulation Plan
+# Swarm Search — Project Handoff
 
-## Overview
+*Last updated: June 2026*
 
-A multi-agent simulation of a drone swarm performing search operations over conflict-affected terrain. The swarm uses a unified pheromone-inspired weight field on a shared 2D grid to coordinate coverage and detection without any central controller.
+## What this project is
 
----
+A simulation of a drone swarm performing autonomous search over conflict-affected
+terrain in Nigeria — specifically targeting two tasks:
 
-## 1. World Representation
+1. **Hideout detection** — coverage search across large terrain (forests, hills,
+   rural settlements) for structures or heat/RF signatures suggesting bandit
+   camps.
+2. **Victim/hostage localization** — once a zone of interest is flagged,
+   narrowing down to precise location.
 
-### The Grid
-- A 2D discrete grid of cells, e.g. `N × N` (start with 100×100).
-- Each cell `(i, j)` holds a **field value** `F[i][j] ∈ [-1.0, 1.0]`.
-- Initial state: all cells set to `0.0` (unexplored / neutral).
+The motivating context is the banditry crisis in Nigeria's Northwest
+(Zamfara, Katsina, Sokoto). This is a generalized-unit simulation — no
+specific hardware platform is assumed. The goal right now is to get the
+coordination algorithm right in simulation before any hardware
+considerations enter the picture.
 
-### Cell States (by field value range)
+## Core idea: unified pheromone field
 
-| Range | Meaning |
-|---|---|
-| `F = 0.0` | Unexplored / neutral |
-| `-1.0 ≤ F < 0.0` | Repulsive — recently covered, avoid |
-| `0.0 < F ≤ 1.0` | Attractive — detection signal present, investigate |
+Instead of coordinating robots with a central controller or explicit
+communication protocol, the swarm coordinates indirectly through a shared
+**virtual pheromone field** — stigmergy, the same mechanism ants use.
 
-The field is the swarm's **collective memory**. All robots read and write to the same grid.
+The field is a scalar grid, each cell holding a value in **[-1, 1]**:
 
----
+- **Negative** = repulsive — "this area is covered, go elsewhere"
+- **Positive** = attractive — "something interesting here, investigate"
+- **Zero** = neutral — unexplored
 
-## 2. Robot Model
+This single scale unifies what would otherwise be two separate systems
+(coverage logic and detection logic) into one number a robot can read and
+act on.
 
-### State Variables (per robot)
-```
-position:     (x, y)          # float coords, maps to grid cell
-velocity:     (vx, vy)        # normalized direction vector
-fov_radius:   r               # current field of view radius (cells)
-fov_base:     r_base          # default FOV radius (e.g. 5 cells)
-fov_max:      r_max           # max FOV radius (e.g. grid diagonal)
-mode:         EXPLORE | CONVERGE
-sensor_conf:  float ∈ [0, 1]  # confidence of current sensor reading
-```
+### Why two channels under the hood
 
-### Sensor Payload (simulated)
-Each robot carries two simulated sensing channels:
-- **Thermal IR** — detects heat signatures (camps, generators, bodies)
-- **RF** — detects phone pings, radio emissions
+Although robots act on a single net field value, the field is actually
+computed from two separate channels that are tracked and decayed
+independently:
 
-In simulation, these are modelled as **ground truth signal fields** placed on the grid, with Gaussian noise added to each robot's reading.
+- `F_cov` — coverage/repulsion, written whenever a robot passes through a
+  cell, decays fast
+- `F_det` — detection/attraction, written when a robot's sensor confidence
+  crosses a threshold, decays slow
 
----
+These are summed into `F_net = clip(F_cov + F_det, -1, 1)` for movement
+decisions. The reason for keeping them separate rather than just using one
+field: if you only had one number, a real detection signal sitting in a
+heavily-searched (strongly repulsive) area could get mathematically
+cancelled out and the swarm would ignore a genuine find. Mode-switching
+logic checks `F_det` directly, not the net field, to avoid this.
 
-## 3. The Pheromone Field
+### Field mechanics
 
-### Signal Types
-Each robot broadcasts a typed signal:
+- Both channels **evaporate toward zero** over time at different rates
+  (`λ_cov` faster, `λ_det` slower) — this is what lets the swarm "forget"
+  old coverage and allows revisiting areas, and also lets it stop chasing
+  a detection that turns out to be stale.
+- The field is **global and shared** — every robot reads and writes to the
+  same grid. There is no per-robot local map; the grid itself is the
+  swarm's collective memory.
 
-```
-signal = (value: float, source_type: "coverage" | "detection")
-```
+## Robot behavior
 
-The grid stores a **net scalar field** used for movement, derived by summing contributions. But robots separately track decomposed channels to avoid suppressing real detections with coverage repulsion.
+Each robot has a **field of view (FOV)** radius. Movement logic:
 
-### Coverage Channel (repulsion)
-When a robot moves through a cell, it writes:
-```
-F_cov[i][j] += -α_cov     # typically -0.2 per pass
-```
-This value decays toward 0 over time (evaporation):
-```
-F_cov[i][j] *= (1 - λ_cov)     # λ_cov ≈ 0.005 per timestep
-```
+1. Scan the field within FOV.
+2. **If the FOV is entirely neutral** (no gradient to follow), the robot
+   doubles its FOV radius and re-scans. This keeps repeating — the FOV
+   keeps expanding — until either a gradient is found, or the FOV has
+   grown to cover the entire shared grid. This was a deliberate choice to
+   keep movement purposeful (gradient-seeking) rather than falling back to
+   random walk in neutral territory.
+3. Two modes:
+   - **EXPLORE** — default mode, follows the gradient down toward neutral
+     (away from repulsion), depositing coverage pheromone as it goes.
+   - **CONVERGE** — triggered when `F_det` in FOV crosses an attraction
+     threshold. Robot follows the `F_det` gradient upward toward the
+     source.
 
-### Detection Channel (attraction)
-When a robot's sensor confidence crosses threshold `θ` in a cell:
-```
-F_det[i][j] += +β_det * sensor_conf    # e.g. +0.3 per timestep
-```
-This also decays, but more slowly (persistent signal):
-```
-F_det[i][j] *= (1 - λ_det)     # λ_det ≈ 0.001 per timestep
-```
+## Distributed detection / quorum rule
 
-### Net Field (movement decision)
-```
-F_net[i][j] = clip(F_cov[i][j] + F_det[i][j], -1.0, 1.0)
-```
-Robots read `F_net` for movement but use the separate channels for mode switching logic.
+A single robot's positive sensor reading does **not** count as a confirmed
+detection — that would make the whole swarm vulnerable to one false
+positive. A detection is only confirmed when **Q independent robots**
+(currently planned: 3) report signal in the same region within a time
+window. This is a distributed voting/quorum mechanism, deliberately chosen
+over "first detection wins" given the humanitarian stakes of acting on a
+wrong call.
 
----
+## Current status
 
-## 4. Robot Behavior
+- **Design phase is done.** Full simulation plan is written (see
+  `swarm_simulation_plan.md` if carried over, or recreate from this doc —
+  the architecture, parameters, and build order are all specified there).
+- **Code status: Pygame implementation already started.** Module
+  architecture in progress:
+  - `grid.py` — field state, read/write, decay
+  - `robot.py` — robot state machine, FOV logic, sensor model
+  - `swarm.py` — collection of robots, quorum accumulator
+  - `simulation.py` — main loop, metric logging
+  - `visualizer.py` — real-time rendering
+  - `config.py` — centralized parameters
+- Recommended build/test order: grid mechanics first (verify numerically
+  before anything visual), then single robot behavior, then multi-robot,
+  then sensor model, then quorum logic, then visualizer, then metrics.
 
-### Movement Rules
+## Key parameters (starting values — expect to tune)
 
-**Step 1: Scan FOV**  
-Robot reads `F_net` for all cells within radius `r` of its position.
-
-**Step 2: FOV Expansion (if neutral)**  
-If all cells in FOV have `|F_net| < ε` (ε ≈ 0.05):
-- Expand `r` by step `Δr` (e.g. +3 cells)
-- Repeat until gradient found OR `r = r_max` (full grid visibility)
-- If `r_max` reached and still neutral → move to random unvisited edge cell
-
-**Step 3: Mode Decision**  
-- If `F_det` channel shows any cell in FOV with `F_det > θ_attract` (e.g. 0.4) → switch to `CONVERGE`
-- Else → stay in `EXPLORE`
-
-**Step 4: Movement**  
-- `EXPLORE`: move in the direction of steepest *decrease* in `F_net` (away from repulsion, toward neutral)
-- `CONVERGE`: move in the direction of steepest *increase* in `F_det` channel specifically
-
-**Step 5: Write to Field**  
-- Always write coverage repulsion to current cell
-- If `sensor_conf > θ_sense` (e.g. 0.3) → write detection attraction
-
----
-
-## 5. Distributed Detection (Quorum Rule)
-
-A detection is **flagged as confirmed** only when:
-- At least `Q` robots (e.g. 3) independently detect signal in the same grid region (within radius `r_confirm`)
-- Within a time window `T_window` timesteps
-
-This prevents a single noisy reading from triggering a mass false positive response.
-
-**Implementation:**  
-Each robot that detects something broadcasts: `(position, confidence, timestamp)` to the shared field. A lightweight confirmation accumulator counts independent contributions per region per time window.
-
----
-
-## 6. Performance Metrics
-
-### Coverage Efficiency
-- **Coverage rate**: percentage of grid cells with `F_cov < -0.1` (visited) at each timestep
-- **Time to 90% coverage**: primary coverage benchmark
-- **Redundancy ratio**: average number of times each cell was visited (lower = more efficient)
-
-### Detection Accuracy
-- **True positive rate**: confirmed detections / total ground truth targets
-- **False positive rate**: false confirmations / total confirmations
-- **Time to first detection**: timesteps until first ground truth target confirmed
-
-### Combined Metric
-```
-Score = w1 * (1 / T_90_coverage) + w2 * TPR - w3 * FPR
-```
-Where `w1, w2, w3` are tunable weights depending on mission priority (speed vs accuracy tradeoff).
-
----
-
-## 7. Simulation Parameters (Initial Values)
-
-| Parameter | Symbol | Initial Value |
+| Parameter | Symbol | Initial value |
 |---|---|---|
 | Grid size | N | 100 × 100 |
 | Number of drones | n | 20 |
@@ -159,56 +121,45 @@ Where `w1, w2, w3` are tunable weights depending on mission priority (speed vs a
 | Coverage write strength | α_cov | 0.2 |
 | Detection write strength | β_det | 0.3 |
 | Neutral threshold | ε | 0.05 |
-| Detection sensor threshold | θ_sense | 0.3 |
+| Sensor detection threshold | θ_sense | 0.3 |
 | Attraction follow threshold | θ_attract | 0.4 |
 | Quorum count | Q | 3 |
 | Quorum time window | T_window | 50 timesteps |
 | Sensor noise std dev | σ | 0.15 |
 
----
+## Test scenarios planned
 
-## 8. Ground Truth Targets (Test Scenarios)
+- **Scenario A (sparse)** — few isolated targets, tests quorum/false
+  positive suppression
+- **Scenario B (clustered)** — targets grouped in one area, tests whether
+  coverage repulsion correctly redirects the swarm after initial spread
+- **Scenario C (adversarial)** — targets intermittently go quiet
+  (simulating radio silence), tests whether detection decay rate allows
+  re-detection without either losing track too fast or holding stale
+  "ghost" detections too long
 
-### Scenario A — Sparse Targets
-- 3 hideouts randomly placed, each with a Gaussian signal profile (σ=5 cells)
-- 2 victim clusters, smaller signal radius (σ=2 cells)
-- Designed to test: quorum rule, false positive suppression
+## Open questions / things to watch
 
-### Scenario B — Clustered Targets
-- Targets grouped in one quadrant
-- Tests: whether coverage pheromone correctly redirects swarm after initial spread
+- FOV expansion fallback: when max FOV is reached and the field is *still*
+  neutral, robot moves to a random unvisited edge cell. "Unvisited" needs
+  a precise definition (likely `|F_cov| < ε`) to avoid robots bouncing at
+  grid boundaries.
+- `λ_det` tuning is the most sensitive parameter — too fast and the swarm
+  loses a target that goes quiet; too slow and false "ghost" detections
+  linger and waste swarm resources.
+- Metrics defined but not yet validated against real simulation runs:
+  coverage rate, time to 90% coverage, redundancy ratio, true/false
+  positive rate, time to first detection, and a combined weighted score.
 
-### Scenario C — Adversarial
-- Targets intermittently suppress their signal (simulating radio silence)
-- Tests: detection decay allowing re-detection, swarm persistence
+## Why this design (in one paragraph, for context)
 
----
-
-## 9. Implementation Stack
-
-```
-Language:     Python 3.x
-Core loop:    NumPy (vectorized field operations)
-Visualization: Matplotlib (real-time heatmap + robot positions)
-              OR Pygame (for smoother animation)
-Architecture: 
-  - grid.py         # Field state, read/write, decay
-  - robot.py        # Robot state machine, FOV logic, sensor model
-  - swarm.py        # Collection of robots, quorum accumulator
-  - simulation.py   # Main loop, metric logging
-  - visualizer.py   # Real-time rendering
-  - config.py       # All parameters in one place
-```
-
----
-
-## 10. Build Order
-
-1. **Grid + field mechanics** — write/read/decay, verify numerically
-2. **Single robot** — FOV scan, expansion, mode switching, movement
-3. **Multi-robot** — shared field access, no inter-robot collision for now
-4. **Sensor model** — ground truth signal + Gaussian noise
-5. **Quorum accumulator** — confirmation logic
-6. **Visualizer** — heatmap of F_net, robot positions, mode colors
-7. **Metrics** — logging and plotting
-8. **Scenario testing** — run A/B/C, tune parameters
+The whole point of stigmergic coordination is that no robot needs a map,
+a leader, or global knowledge — intelligence emerges from local
+interactions through the shared field. This matters specifically for
+this application because conflict-zone deployments are exactly where
+centralized control (single base station, hierarchical command structure)
+is most fragile — it's a single point of failure and a jamming target.
+A self-organizing, self-healing swarm where losing a unit just means
+nearby pheromone repulsion fades and others drift in to cover the gap is
+much more robust to the kind of adversarial, degraded-communication
+environment this is actually meant to operate in.
