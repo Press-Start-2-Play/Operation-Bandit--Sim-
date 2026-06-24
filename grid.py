@@ -14,6 +14,6 @@ class Grid:
             pygame.draw.line(screen, (255, 255, 255), (0, y), (height, y), 1)
         pygame.draw.circle(screen, (0, 0, 200), (width // 2, height // 2), 3)
     
-    grid_positions = {pygame.vector(450,310) : -0.9} # Positions and their weights, would be upddated ny te drones and eould get insanely big.
+    grid_positions = {pygame.Vector2(450,310) : -0.9} # Positions and their weights, would be upddated by mi drones and eould get insanely big.
 
-# I'd be making the spacing like 15. Tht screen would be 900 by 700... I think that's okay.
+# I'd be making the spacing like 15. Tht screen would be 700 by 900... I think that's okay.
