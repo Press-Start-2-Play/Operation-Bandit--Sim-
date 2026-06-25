@@ -46,6 +46,8 @@ Drone_1  = Drone(pygame.Vector2(500, 450))
 Drone_2  = Drone(pygame.Vector2(500, 450))
 Drone_3  = Drone(pygame.Vector2(500, 450))
 Drone_4  = Drone(pygame.Vector2(500, 450))
+Drone_1.centre_movement(0.016)
+print(Drone_1.position)
 Drone.radial_dispersal(Drone)
 
 
